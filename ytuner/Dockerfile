@@ -9,24 +9,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sqlite3 \
     libsqlite3-0 \
     wget \
-    libarchive-tools \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Download YTuner binary (detect architecture from running system)
 RUN YTUNER_VER="1.2.6" && \
     MACHINE="$(uname -m)" && \
     case "${MACHINE}" in \
-      x86_64)  ARCH="amd64" ;; \
-      aarch64) ARCH="aarch64" ;; \
-      armv7l)  ARCH="armhf" ;; \
+      x86_64)  ASSET="ytuner-${YTUNER_VER}-x86_64-linux.zip" ;; \
+      aarch64) ASSET="ytuner-${YTUNER_VER}-aarch64-arm64-armv7-armv8-armv9-linux.zip" ;; \
       *)       echo "Unsupported architecture: ${MACHINE}" && exit 1 ;; \
     esac && \
-    wget -q "https://github.com/coffeegreg/YTuner/releases/download/v${YTUNER_VER}/ytuner-${YTUNER_VER}-linux-${ARCH}.tar.xz" \
-      -O /tmp/ytuner.tar.xz && \
+    wget -q "https://github.com/coffeegreg/YTuner/releases/download/${YTUNER_VER}/${ASSET}" \
+      -O /tmp/ytuner.zip && \
+    mkdir -p /opt/ytuner && \
+    unzip -q /tmp/ytuner.zip -d /tmp/ytuner-extract && \
+    cp -a /tmp/ytuner-extract/ytuner-*/* /opt/ytuner/ && \
     mkdir -p /opt/ytuner/config /opt/ytuner/cache /opt/ytuner/db && \
-    bsdtar -xf /tmp/ytuner.tar.xz -C /opt/ytuner --strip-components=1 && \
     chmod +x /opt/ytuner/ytuner && \
-    rm /tmp/ytuner.tar.xz
+    rm -rf /tmp/ytuner.zip /tmp/ytuner-extract
 
 # Copy rootfs overlay (S6 services, nginx config, Python scripts)
 COPY rootfs /
