@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.1
+
+- Fix YTuner binding to listen on 127.0.0.1 (nginx proxy was getting "Connection refused")
+- Fix release download URLs and archive format (zip, correct tag names)
+- Fix S6 environment variable path (/run/s6/ not /var/run/s6/)
+
 ## 1.0.0
 
 - Initial release
