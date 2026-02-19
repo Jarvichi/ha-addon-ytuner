@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2
+
+- Fix speaker discovery: write YTuner log to /data/ytuner.log so the web UI can tail it for preset detection
+- Discovery was failing because LOG_FILE pointed to /proc/1/fd/1 (container stdout) which can't be tailed
+
 ## 1.0.1
 
 - Fix YTuner binding to listen on 127.0.0.1 (nginx proxy was getting "Connection refused")

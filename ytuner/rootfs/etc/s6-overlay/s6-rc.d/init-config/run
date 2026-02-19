@@ -170,6 +170,8 @@ printf "%s" "${transcode_max_concurrent}" > /run/s6/container_environment/TRANSC
 printf "%s" "${server_ip}" > /run/s6/container_environment/YTUNER_SERVER_IP
 printf "8888" > /run/s6/container_environment/TRANSCODE_PORT
 printf "8080" > /run/s6/container_environment/WEBUI_PORT
+printf "/data/ytuner.log" > /run/s6/container_environment/YTUNER_LOG_FILE
+touch /data/ytuner.log
 
 # Persistence for webui state files
 if [[ ! -f /data/speakers.json ]]; then

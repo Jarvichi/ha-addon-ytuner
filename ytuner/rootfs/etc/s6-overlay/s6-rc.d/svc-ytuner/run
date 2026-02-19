@@ -2,8 +2,11 @@
 # shellcheck shell=bash
 # ==============================================================================
 # Home Assistant Add-on: YTuner - YTuner Server
+# Logs to /data/ytuner.log so the web UI discovery can tail it
 # ==============================================================================
 
-bashio::log.info "Starting YTuner server..."
+YTUNER_LOG="/data/ytuner.log"
+
+bashio::log.info "Starting YTuner server (log: ${YTUNER_LOG})..."
 cd /opt/ytuner || exit 1
-exec /opt/ytuner/ytuner
+/opt/ytuner/ytuner >> "${YTUNER_LOG}" 2>&1
