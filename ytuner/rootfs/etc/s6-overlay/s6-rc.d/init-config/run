@@ -144,7 +144,7 @@ CommonBookmark=0
 BookmarkStationsLimit=100
 
 [WebServer]
-WebServerIPAddress=default
+WebServerIPAddress=127.0.0.1
 WebServerPort=18081
 
 [DNSServer]
