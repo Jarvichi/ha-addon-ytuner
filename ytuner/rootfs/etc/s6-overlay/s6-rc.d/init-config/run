@@ -1,0 +1,184 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# Home Assistant Add-on: YTuner - Init Configuration
+# Generates config files from HA add-on options on startup
+# ==============================================================================
+
+declare log_level
+declare transcode_bitrate
+declare transcode_max_concurrent
+declare server_ip
+declare msg_info_level
+
+bashio::log.info "Initialising YTuner configuration..."
+
+# ── Read add-on options ──────────────────────────────────────────────────────
+
+log_level=$(bashio::config 'log_level')
+transcode_bitrate=$(bashio::config 'transcode_bitrate')
+transcode_max_concurrent=$(bashio::config 'transcode_max_concurrent')
+
+# Map log_level to YTuner MessageInfoLevel
+case "${log_level}" in
+    none)    msg_info_level=0 ;;
+    info)    msg_info_level=1 ;;
+    warning) msg_info_level=2 ;;
+    error)   msg_info_level=3 ;;
+    debug)   msg_info_level=4 ;;
+    *)       msg_info_level=1 ;;
+esac
+
+# ── Detect host IP ───────────────────────────────────────────────────────────
+
+server_ip=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -1)
+if [[ -z "${server_ip}" ]]; then
+    server_ip=$(hostname -I | awk '{print $1}')
+fi
+bashio::log.info "Detected server IP: ${server_ip}"
+
+# ── Ensure persistent data directories ───────────────────────────────────────
+
+mkdir -p /data/config /data/db /data/cache
+
+# Copy default config files on first run
+if [[ ! -f /data/config/stations.ini ]]; then
+    if [[ -f /opt/ytuner/stations.ini ]]; then
+        cp /opt/ytuner/stations.ini /data/config/stations.ini
+    else
+        cat > /data/config/stations.ini << 'STATIONS'
+[My Stations]
+BBC World Service=http://stream.live.vc.bbcmedia.co.uk/bbc_world_service
+Classic FM=http://media-ice.musicradio.com/ClassicFMMP3
+STATIONS
+    fi
+    bashio::log.info "Created default stations.ini"
+fi
+
+if [[ ! -f /data/config/avr.ini ]]; then
+    if [[ -f /opt/ytuner/avr.ini ]]; then
+        cp /opt/ytuner/avr.ini /data/config/avr.ini
+    else
+        cat > /data/config/avr.ini << 'AVR'
+[Configuration]
+INIVersion=1.0.2
+Protocol=all-as-http
+
+[MainMenu Items]
+IdentifiersList=about;bookmarks;mystations;radiobrowser
+LabelsList=*** YTuner ***;Favourites;My Stations;Radio Browser
+
+[RadioBrowser Filtering]
+AllowedTags=
+NotAllowedTags=
+AllowedCountries=
+AllowedLanguages=
+AllowedCodecs=
+NotAllowedCodecs=
+BitrateMax=
+NotAllowedInName=
+NotAllowedInURL=
+
+[RadioBrowser Sorting]
+Order=name
+Reverse=0
+
+[Translator]
+Enable=0
+Auto=0
+LanguageCode=
+ReplaceUTF8Latin1Supplement=0
+ReplaceUTF8Latin1ExtendedA=0
+ReplaceUTF8Latin1ExtendedB=0
+AVR
+    fi
+    bashio::log.info "Created default avr.ini"
+fi
+
+# ── Symlink config/db/cache into /opt/ytuner ─────────────────────────────────
+
+# Remove the directories created at build time, replace with symlinks
+rm -rf /opt/ytuner/config /opt/ytuner/db /opt/ytuner/cache
+ln -sf /data/config /opt/ytuner/config
+ln -sf /data/db /opt/ytuner/db
+ln -sf /data/cache /opt/ytuner/cache
+
+# ── Generate ytuner.ini ──────────────────────────────────────────────────────
+
+cat > /opt/ytuner/ytuner.ini << YTUNERINI
+[Configuration]
+INIVersion=1.2.2
+IPAddress=${server_ip}
+ActAsHost=default
+UseSSL=1
+RedirectHTTPCode=302
+MessageInfoLevel=${msg_info_level}
+IconSize=200
+IconCache=1
+IconEndPointExtension=
+MyToken=0123456789ABCDEF
+CommonAVRini=1
+CacheFolderLocation=default
+ConfigFolderLocation=default
+DBFolderLocation=default
+DBLibFile=default
+
+[MyStations]
+Enable=1
+MyStationsFile=stations.ini
+MyStationsAutoRefreshPeriod=0
+
+[Radiobrowser]
+Enable=1
+RBAPIURL=http://all.api.radio-browser.info
+RBPopularAndSearchStationsLimit=100
+RBMinStationsPerCategory=1
+RBUUIDsCacheTTL=0
+RBUUIDsCacheAutoRefresh=0
+RBCacheType=catPermMemDB
+RBCacheTTL=0
+
+[Bookmark]
+Enable=1
+CommonBookmark=0
+BookmarkStationsLimit=100
+
+[WebServer]
+WebServerIPAddress=default
+WebServerPort=18081
+
+[DNSServer]
+Enable=0
+DNSServerIPAddress=default
+DNSServerPort=53
+InterceptDNs=*.vtuner.com,*.radiosetup.com,*.my-noxon.net,*.radiomarantz.com
+DNSServers=8.8.8.8,9.9.9.9
+
+[MaintenanceServer]
+Enable=0
+MaintenanceServerIPAddress=127.0.0.1
+MaintenanceServerPort=18082
+YTUNERINI
+
+bashio::log.info "Generated ytuner.ini (port 18081, DNS disabled)"
+
+# ── Export environment for child services ────────────────────────────────────
+
+# Write env vars for transcode proxy and webui
+printf "%s" "${transcode_bitrate}" > /run/s6/container_environment/TRANSCODE_BITRATE
+printf "%s" "${transcode_max_concurrent}" > /run/s6/container_environment/TRANSCODE_MAX_CONCURRENT
+printf "%s" "${server_ip}" > /run/s6/container_environment/YTUNER_SERVER_IP
+printf "8888" > /run/s6/container_environment/TRANSCODE_PORT
+printf "8080" > /run/s6/container_environment/WEBUI_PORT
+
+# Persistence for webui state files
+if [[ ! -f /data/speakers.json ]]; then
+    echo '{}' > /data/speakers.json
+fi
+if [[ ! -f /data/links.json ]]; then
+    echo '[]' > /data/links.json
+fi
+ln -sf /data/speakers.json /opt/ytuner/speakers.json
+ln -sf /data/links.json /opt/ytuner/links.json
+
+bashio::log.info "YTuner configuration complete"

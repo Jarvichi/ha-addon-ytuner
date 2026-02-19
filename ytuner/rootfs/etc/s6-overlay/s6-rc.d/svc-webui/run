@@ -1,0 +1,8 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# Home Assistant Add-on: YTuner - Web Management UI
+# ==============================================================================
+
+bashio::log.info "Starting web UI (port 8080)..."
+exec python3 /opt/ytuner/webui.py

@@ -1,0 +1,8 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# Home Assistant Add-on: YTuner - Transcoding Proxy
+# ==============================================================================
+
+bashio::log.info "Starting transcode proxy (port 8888)..."
+exec python3 /opt/ytuner/transcode-proxy.py

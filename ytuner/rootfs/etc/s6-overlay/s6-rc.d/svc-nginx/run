@@ -1,0 +1,8 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# Home Assistant Add-on: YTuner - Nginx Reverse Proxy
+# ==============================================================================
+
+bashio::log.info "Starting nginx reverse proxy..."
+exec nginx -g 'daemon off;'
