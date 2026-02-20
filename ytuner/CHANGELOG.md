@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1
+
+- Remove URL column from speaker preset table for a cleaner view
+- Sort station library alphabetically by station name and category
+- Remove manual station reorder controls (drag-and-drop, up/down arrows)
+
 ## 1.1.0
 
 - Add Backup & Restore: export/import all config (stations, speakers, links) as a single JSON file

@@ -1524,10 +1524,6 @@ label { font-size: 0.8rem; color: var(--text2); margin-bottom: 4px; display: blo
   border-top: 1px solid var(--border);
 }
 
-/* Station drag */
-.station-item.dragging { opacity: 0.4; }
-.station-item.drag-over { border-top: 2px solid var(--accent); }
-
 /* Copy presets modal */
 .speaker-pick {
   display: flex;
@@ -1965,12 +1961,11 @@ function renderSpeakers() {
         </div>
       </div>
       <table class="preset-table">
-        <tr><th>#</th><th>Station</th><th>URL</th><th>Format</th><th></th></tr>
+        <tr><th>#</th><th>Station</th><th>Format</th><th></th></tr>
         ${s.presets.map((p, pi) => `
           <tr>
             <td class="preset-num">${pi+1} <span class="unb-badge">${esc(p.id)}</span></td>
             <td>${esc(p.name) || '<span class="text-muted">Empty</span>'}</td>
-            <td class="preset-url" title="${esc(p.url)}">${esc(p.url)}</td>
             <td><span class="text-muted">${esc(p.format)}</span></td>
             <td style="white-space:nowrap">
               ${pi > 0 ? `<button class="btn-move" onclick="movePreset('${esc(s.ip)}',${pi},${pi-1})" title="Move up">&#9650;</button>` : ''}
@@ -2113,30 +2108,21 @@ function renderStations() {
     el.innerHTML = '<div class="card"><p class="text-muted">No stations configured.</p></div>';
     return;
   }
-  const catKeys = cats.map(c => c[0]);
+  // Sort stations alphabetically within each category
+  cats.forEach(([cat, stations]) => stations.sort((a, b) => a.name.localeCompare(b.name, undefined, {sensitivity: 'base'})));
+  // Sort categories alphabetically
+  cats.sort((a, b) => a[0].localeCompare(b[0], undefined, {sensitivity: 'base'}));
   el.innerHTML = cats.map(([cat, stations], ci) => `
     <div class="card">
       <div class="card-header">
-        <div style="display:flex;align-items:center;gap:8px">
-          ${ci > 0 ? `<button class="btn-move" onclick="moveCat(${ci},${ci-1})" title="Move category up">&#9650;</button>` : ''}
-          ${ci < cats.length - 1 ? `<button class="btn-move" onclick="moveCat(${ci},${ci+1})" title="Move category down">&#9660;</button>` : ''}
-          <h3>${esc(cat)} <span class="category-count">(${stations.length})</span></h3>
-        </div>
+        <h3>${esc(cat)} <span class="category-count">(${stations.length})</span></h3>
         <div class="btn-group">
           <button class="btn btn-sm" onclick="addStationToCat('${escAttr(cat)}')">Add</button>
           ${cat !== 'Presets' ? `<button class="btn btn-sm btn-danger" onclick="deleteCategory('${escAttr(cat)}')">Delete Category</button>` : ''}
         </div>
       </div>
       ${stations.map((s, si) => `
-        <div class="station-item" draggable="true"
-             ondragstart="stationDragStart(event,'${escAttr(cat)}',${si})"
-             ondragover="stationDragOver(event)"
-             ondragenter="stationDragEnter(event)"
-             ondragleave="stationDragLeave(event)"
-             ondrop="stationDrop(event,'${escAttr(cat)}',${si})"
-             ondragend="stationDragEnd(event)">
-          ${si > 0 ? `<button class="btn-move" onclick="moveStation('${escAttr(cat)}',${si},${si-1})" title="Move up">&#9650;</button>` : '<span style="width:22px;display:inline-block"></span>'}
-          ${si < stations.length - 1 ? `<button class="btn-move" onclick="moveStation('${escAttr(cat)}',${si},${si+1})" title="Move down">&#9660;</button>` : '<span style="width:22px;display:inline-block"></span>'}
+        <div class="station-item">
           <button class="btn-play" onclick="previewStation('${escAttr(s.url)}', this)" title="Preview">&#9654;</button>
           <span class="station-name">${esc(s.name)}${s._dead ? ' <span class=\"health-badge dead\">offline</span>' : ''}</span>
           <span class="station-url" title="${esc(s.url)}">${esc(s.url)}</span>
@@ -2908,63 +2894,6 @@ async function commitImport() {
   } else {
     toast(result.error || 'Import failed', true);
   }
-}
-
-// ── Station Reordering ───────────────────────────────────
-async function moveStation(cat, fromIdx, toIdx) {
-  const stations = stationsData[cat];
-  if (!stations || toIdx < 0 || toIdx >= stations.length) return;
-  const [item] = stations.splice(fromIdx, 1);
-  stations.splice(toIdx, 0, item);
-  renderStations();
-  await api('/api/stations', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(stationsData),
-  });
-}
-
-async function moveCat(fromIdx, toIdx) {
-  const entries = Object.entries(stationsData);
-  const [item] = entries.splice(fromIdx, 1);
-  entries.splice(toIdx, 0, item);
-  stationsData = Object.fromEntries(entries);
-  renderStations();
-  await api('/api/stations', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(stationsData),
-  });
-}
-
-// Drag-and-drop for stations within same category
-let dragCat = null, dragIdx = null;
-function stationDragStart(e, cat, idx) {
-  dragCat = cat; dragIdx = idx;
-  e.target.classList.add('dragging');
-  e.dataTransfer.effectAllowed = 'move';
-}
-function stationDragOver(e) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; }
-function stationDragEnter(e) { e.preventDefault(); e.currentTarget.classList.add('drag-over'); }
-function stationDragLeave(e) { e.currentTarget.classList.remove('drag-over'); }
-function stationDragEnd(e) {
-  e.target.classList.remove('dragging');
-  document.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
-}
-function stationDrop(e, targetCat, targetIdx) {
-  e.preventDefault();
-  e.currentTarget.classList.remove('drag-over');
-  if (dragCat !== targetCat || dragIdx === null || dragIdx === targetIdx) return;
-  const stations = stationsData[dragCat];
-  const [item] = stations.splice(dragIdx, 1);
-  stations.splice(targetIdx, 0, item);
-  renderStations();
-  api('/api/stations', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(stationsData),
-  });
-  dragCat = null; dragIdx = null;
 }
 
 // ── Init ─────────────────────────────────────────────────
