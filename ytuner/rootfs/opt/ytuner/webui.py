@@ -5,7 +5,9 @@ Single-file web app for managing Libratone speaker presets and station library.
 Serves on port 8080 — stdlib only, no pip installs needed.
 """
 
+import collections
 import configparser
+import datetime
 import json
 import logging
 import os
@@ -402,6 +404,70 @@ def probe_stream(url):
     return result
 
 
+# ── Health check state (shared across threads) ───────────────────────────────
+
+healthcheck_lock = threading.Lock()
+healthcheck_state = {
+    "running": False,
+    "total": 0,
+    "checked": 0,
+    "results": [],  # list of {"category", "name", "url", "alive": bool, "error": str}
+}
+
+
+def _healthcheck_worker():
+    """Background thread: probe all stations for health."""
+    try:
+        stations = read_stations_ini()
+        items = []
+        for cat, stns in stations.items():
+            for s in stns:
+                items.append((cat, s["name"], s["url"]))
+        with healthcheck_lock:
+            healthcheck_state["total"] = len(items)
+            healthcheck_state["checked"] = 0
+            healthcheck_state["results"] = []
+
+        for cat, name, url in items:
+            alive = False
+            error = ""
+            try:
+                # Strip transcode wrapper to probe the actual stream
+                probe_url = url
+                try:
+                    u = urlparse(url)
+                    if u.path == "/transcode" and "url=" in (u.query or ""):
+                        qs = parse_qs(u.query)
+                        if "url" in qs:
+                            probe_url = qs["url"][0]
+                except Exception:
+                    pass
+                req = Request(probe_url, method="HEAD",
+                              headers={"User-Agent": "YTuner-WebUI/1.0"})
+                with urlopen(req, timeout=5) as resp:
+                    alive = resp.status < 400
+            except Exception as e:
+                try:
+                    req = Request(probe_url,
+                                  headers={"User-Agent": "YTuner-WebUI/1.0",
+                                           "Range": "bytes=0-0"})
+                    with urlopen(req, timeout=5) as resp:
+                        alive = resp.status < 400
+                except Exception as e2:
+                    error = str(e2)
+
+            result = {"category": cat, "name": name, "url": url,
+                      "alive": alive, "error": error}
+            with healthcheck_lock:
+                healthcheck_state["results"].append(result)
+                healthcheck_state["checked"] += 1
+    except Exception as e:
+        log.error("Health check failed: %s", e)
+    finally:
+        with healthcheck_lock:
+            healthcheck_state["running"] = False
+
+
 def _is_container():
     """Detect if running inside a container (HA add-on)."""
     return os.path.exists("/run/s6/container_environment")
@@ -516,6 +582,12 @@ class WebUIHandler(BaseHTTPRequestHandler):
             self._handle_services_status()
         elif path == "/api/links":
             self._handle_list_links()
+        elif path == "/api/backup":
+            self._handle_backup_export()
+        elif path == "/api/logs":
+            self._handle_logs(params)
+        elif path == "/api/stations/healthcheck":
+            self._handle_healthcheck_status()
         else:
             self.send_error(404)
 
@@ -541,6 +613,12 @@ class WebUIHandler(BaseHTTPRequestHandler):
             self._handle_service_restart()
         elif path == "/api/links":
             self._handle_save_links()
+        elif path == "/api/backup/restore":
+            self._handle_backup_restore()
+        elif path == "/api/stations/healthcheck":
+            self._handle_healthcheck_start()
+        elif path == "/api/stations/import":
+            self._handle_station_import()
         else:
             self.send_error(404)
 
@@ -777,6 +855,179 @@ class WebUIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json({"error": str(e)}, 500)
 
+    # ── Backup & Restore endpoints ────────────────────────────────────
+
+    def _handle_backup_export(self):
+        try:
+            bundle = {
+                "version": 1,
+                "date": datetime.datetime.now().isoformat(),
+                "stations_ini": "",
+                "speakers_json": {},
+                "links_json": [],
+                "speaker_xmls": {},
+            }
+            if os.path.exists(STATIONS_INI):
+                with open(STATIONS_INI, "r", encoding="utf-8") as f:
+                    bundle["stations_ini"] = f.read()
+            bundle["speakers_json"] = read_speaker_names()
+            bundle["links_json"] = read_links()
+            for ip in list_speakers():
+                xml_path = os.path.join(CONFIG_DIR, f"{ip}.xml")
+                if os.path.exists(xml_path):
+                    with open(xml_path, "r", encoding="utf-8") as f:
+                        bundle["speaker_xmls"][ip] = f.read()
+            body = json.dumps(bundle, indent=2).encode()
+            datestamp = datetime.datetime.now().strftime("%Y%m%d")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="ytuner-backup-{datestamp}.json"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def _handle_backup_restore(self):
+        try:
+            data = json.loads(self._read_body())
+            if data.get("version") != 1:
+                self._send_json({"error": "Unknown backup version"}, 400)
+                return
+            # Restore stations.ini
+            if data.get("stations_ini"):
+                with open(STATIONS_INI, "w", encoding="utf-8") as f:
+                    f.write(data["stations_ini"])
+            # Restore speakers.json
+            if "speakers_json" in data:
+                write_speaker_names(data["speakers_json"])
+            # Restore links.json
+            if "links_json" in data:
+                write_links(data["links_json"])
+            # Restore speaker XMLs
+            for ip, xml_content in data.get("speaker_xmls", {}).items():
+                if validate_ip(ip):
+                    xml_path = os.path.join(CONFIG_DIR, f"{ip}.xml")
+                    with open(xml_path, "w", encoding="utf-8") as f:
+                        f.write(xml_content)
+            threading.Thread(target=restart_ytuner, daemon=True).start()
+            self._send_json({"ok": True})
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    # ── Log Viewer endpoint ───────────────────────────────────────────
+
+    def _handle_logs(self, params):
+        file_key = params.get("file", ["ytuner"])[0]
+        lines = min(int(params.get("lines", ["100"])[0]), 500)
+        log_paths = {
+            "ytuner": LOG_FILE,
+            "nginx": "/data/nginx-access.log",
+        }
+        path = log_paths.get(file_key)
+        if not path:
+            self._send_json({"error": "Unknown log file"}, 400)
+            return
+        if not os.path.exists(path):
+            self._send_json({"lines": [], "file": file_key,
+                             "error": f"Log file not found: {path}"})
+            return
+        try:
+            with open(path, "rb") as f:
+                dq = collections.deque(f, maxlen=lines)
+            log_lines = []
+            for raw in dq:
+                try:
+                    log_lines.append(raw.decode("utf-8", errors="replace").rstrip("\n"))
+                except Exception:
+                    log_lines.append(raw.decode("latin-1").rstrip("\n"))
+            self._send_json({"lines": log_lines, "file": file_key})
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    # ── Health Check endpoints ────────────────────────────────────────
+
+    def _handle_healthcheck_start(self):
+        with healthcheck_lock:
+            if healthcheck_state["running"]:
+                self._send_json({"error": "Health check already running"}, 409)
+                return
+            healthcheck_state["running"] = True
+            healthcheck_state["total"] = 0
+            healthcheck_state["checked"] = 0
+            healthcheck_state["results"] = []
+        t = threading.Thread(target=_healthcheck_worker, daemon=True)
+        t.start()
+        self._send_json({"ok": True})
+
+    def _handle_healthcheck_status(self):
+        with healthcheck_lock:
+            self._send_json({
+                "running": healthcheck_state["running"],
+                "total": healthcheck_state["total"],
+                "checked": healthcheck_state["checked"],
+                "results": list(healthcheck_state["results"]),
+            })
+
+    # ── M3U / OPML Import endpoint ────────────────────────────────────
+
+    def _handle_station_import(self):
+        try:
+            data = json.loads(self._read_body())
+            fmt = data.get("format", "").lower()
+            content = data.get("content", "")
+            if not content:
+                self._send_json({"error": "No content provided"}, 400)
+                return
+
+            stations = []
+            if fmt == "m3u":
+                stations = self._parse_m3u(content)
+            elif fmt == "opml":
+                stations = self._parse_opml(content)
+            else:
+                self._send_json({"error": f"Unknown format: {fmt}"}, 400)
+                return
+
+            self._send_json({"stations": stations})
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def _parse_m3u(self, content):
+        stations = []
+        lines = content.splitlines()
+        name = None
+        for line in lines:
+            line = line.strip()
+            if line.startswith("#EXTINF:"):
+                # #EXTINF:duration,Station Name
+                parts = line.split(",", 1)
+                name = parts[1].strip() if len(parts) > 1 else "Unknown"
+            elif line and not line.startswith("#"):
+                stations.append({
+                    "name": name or "Unknown",
+                    "url": line,
+                })
+                name = None
+        return stations
+
+    def _parse_opml(self, content):
+        stations = []
+        try:
+            root = ET.fromstring(content)
+            for outline in root.iter("outline"):
+                url = (outline.get("URL") or outline.get("url") or
+                       outline.get("xmlUrl") or outline.get("xmlurl") or "")
+                text = (outline.get("text") or outline.get("title") or
+                        "Unknown")
+                otype = (outline.get("type") or "").lower()
+                if url and (otype in ("audio", "link", "") or url.startswith("http")):
+                    stations.append({"name": text.strip(), "url": url.strip()})
+        except ET.ParseError as e:
+            raise ValueError(f"Invalid OPML XML: {e}")
+        return stations
+
 
 # ── Embedded HTML/CSS/JS ─────────────────────────────────────────────────────
 
@@ -816,6 +1067,7 @@ header {
   display: flex;
   align-items: center;
   gap: 16px;
+  flex-wrap: wrap;
 }
 header h1 { font-size: 1.3rem; font-weight: 600; }
 header h1 span { color: var(--accent); }
@@ -823,6 +1075,7 @@ header h1 span { color: var(--accent); }
   display: flex;
   gap: 4px;
   margin-left: auto;
+  flex-wrap: wrap;
 }
 .tab {
   padding: 8px 20px;
@@ -851,6 +1104,7 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px; }
   border-radius: var(--radius);
   padding: 20px;
   margin-bottom: 16px;
+  overflow-x: auto;
 }
 .card-header {
   display: flex;
@@ -892,7 +1146,7 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px; }
 .speaker-name-input:focus { outline: none; border-color: var(--accent); }
 
 /* Preset table */
-.preset-table { width: 100%; border-collapse: collapse; }
+.preset-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 .preset-table th {
   text-align: left;
   padding: 6px 10px;
@@ -936,13 +1190,13 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px; }
 }
 .btn-move:hover { background: var(--border); }
 .preset-url {
-  max-width: 300px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text2);
   font-size: 0.8rem;
   font-family: monospace;
+  word-break: break-all;
 }
 
 /* Buttons */
@@ -1193,6 +1447,172 @@ label { font-size: 0.8rem; color: var(--text2); margin-bottom: 4px; display: blo
 }
 .probe-result.ok { border-color: var(--green); }
 .probe-result.warn { border-color: var(--orange); }
+
+/* Log viewer */
+.log-viewer {
+  background: #0d0e1a;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  font-family: "Consolas", "Monaco", monospace;
+  font-size: 0.8rem;
+  line-height: 1.6;
+  max-height: 60vh;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #c0c0d0;
+}
+.log-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.log-controls select {
+  width: auto;
+  min-width: 80px;
+}
+
+/* Health check */
+.health-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.health-badge.alive { background: var(--green); color: #fff; }
+.health-badge.dead { background: var(--red); color: #fff; }
+.health-progress {
+  height: 4px;
+  background: var(--surface2);
+  border-radius: 2px;
+  margin: 8px 0;
+  overflow: hidden;
+}
+.health-progress-bar {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s;
+}
+
+/* Import preview */
+.import-preview {
+  max-height: 300px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin: 12px 0;
+}
+.import-item {
+  display: flex;
+  align-items: center;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  gap: 8px;
+}
+.import-item:last-child { border-bottom: none; }
+.import-item label { display: flex; align-items: center; gap: 8px; flex: 1; margin: 0; font-size: 0.9rem; color: var(--text); }
+.import-item .station-url { flex: 1; }
+
+/* Backup section */
+.backup-section {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+
+/* Station drag */
+.station-item.dragging { opacity: 0.4; }
+.station-item.drag-over { border-top: 2px solid var(--accent); }
+
+/* Copy presets modal */
+.speaker-pick {
+  display: flex;
+  align-items: center;
+  padding: 12px;
+  cursor: pointer;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  margin-bottom: 8px;
+  transition: border-color 0.15s;
+}
+.speaker-pick:hover { border-color: var(--accent); background: var(--surface2); }
+
+/* ── Mobile responsive ─────────────────────────────── */
+@media (max-width: 768px) {
+  header {
+    padding: 10px 12px;
+    gap: 8px;
+  }
+  header h1 { font-size: 1.1rem; }
+  .tabs { margin-left: 0; width: 100%; }
+  .tab { padding: 6px 10px; font-size: 0.8rem; flex: 1; text-align: center; }
+  main { padding: 12px; }
+  .card { padding: 12px; }
+  .card-header { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .flex-between { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .btn-group { flex-wrap: wrap; }
+  .speaker-title { flex-wrap: wrap; }
+  .speaker-name-input { width: 100%; }
+
+  /* Switch preset table to stacked card layout on mobile */
+  .preset-table { table-layout: auto; }
+  .preset-table thead { display: none; }
+  .preset-table tr {
+    display: flex;
+    flex-wrap: wrap;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    gap: 4px;
+    align-items: center;
+  }
+  .preset-table tr:last-child { border-bottom: none; }
+  .preset-table td { border-bottom: none; padding: 2px 4px; font-size: 0.85rem; }
+  .preset-num { width: auto; text-align: left; }
+  .preset-url {
+    width: 100%;
+    max-width: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 0.75rem;
+  }
+
+  /* Station items stack on mobile */
+  .station-item {
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 8px 6px;
+  }
+  .station-name { flex: 1 1 60%; min-width: 0; }
+  .station-url {
+    flex: 1 1 100%;
+    order: 10;
+    font-size: 0.75rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .search-result { flex-wrap: wrap; gap: 8px; }
+  .search-bar { flex-direction: column; }
+  .form-row { flex-direction: column; }
+  .modal { width: 95%; padding: 16px; max-height: 90vh; }
+  .log-viewer { font-size: 0.7rem; max-height: 50vh; }
+  .log-controls { gap: 6px; }
+  .link-card { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .link-url { word-break: break-all; }
+}
+
+@media (max-width: 480px) {
+  .tab { padding: 5px 6px; font-size: 0.75rem; }
+  main { padding: 8px; }
+  .card { padding: 10px; }
+  .btn { padding: 5px 10px; font-size: 0.8rem; }
+  .btn-sm { padding: 3px 8px; font-size: 0.75rem; }
+}
 </style>
 </head>
 <body>
@@ -1203,6 +1623,7 @@ label { font-size: 0.8rem; color: var(--text2); margin-bottom: 4px; display: blo
     <button class="tab active" data-panel="speakers">Speakers</button>
     <button class="tab" data-panel="stations">Station Library</button>
     <button class="tab" data-panel="services">Services</button>
+    <button class="tab" data-panel="logs">Logs</button>
     <button class="tab" data-panel="links">Links</button>
   </div>
 </header>
@@ -1223,6 +1644,8 @@ label { font-size: 0.8rem; color: var(--text2); margin-bottom: 4px; display: blo
       <h2>Station Library</h2>
       <div class="btn-group">
         <button class="btn" onclick="showAddStation()">Add Station</button>
+        <button class="btn" onclick="showImportModal()">Import</button>
+        <button class="btn" onclick="startHealthCheck()" id="btn-healthcheck">Check Health</button>
         <button class="btn btn-primary" onclick="showSearchRadio()">Search Radio Browser</button>
       </div>
     </div>
@@ -1234,6 +1657,33 @@ label { font-size: 0.8rem; color: var(--text2); margin-bottom: 4px; display: blo
     <h2 class="mb">System Services</h2>
     <div class="card">
       <div id="services-list"></div>
+      <div class="backup-section">
+        <h3 style="margin-bottom:12px">Backup &amp; Restore</h3>
+        <p class="text-muted mb">Export all stations, speakers, and links as a single JSON file. Import to restore.</p>
+        <div class="btn-group">
+          <button class="btn btn-primary" onclick="exportBackup()">Export Backup</button>
+          <button class="btn" onclick="document.getElementById('restore-file').click()">Import Backup</button>
+          <input type="file" id="restore-file" accept=".json" style="display:none" onchange="importBackup(this)">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Logs Panel -->
+  <div id="logs" class="panel">
+    <h2 class="mb">Log Viewer</h2>
+    <div class="card">
+      <div class="log-controls">
+        <button class="btn btn-sm btn-primary" onclick="loadLogs('ytuner')" id="btn-log-ytuner">YTuner Log</button>
+        <button class="btn btn-sm" onclick="loadLogs('nginx')" id="btn-log-nginx">Nginx Access Log</button>
+        <select id="log-lines" onchange="loadLogs()">
+          <option value="50">50 lines</option>
+          <option value="100" selected>100 lines</option>
+          <option value="200">200 lines</option>
+        </select>
+        <button class="btn btn-sm" onclick="loadLogs()">Refresh</button>
+      </div>
+      <div id="log-content" class="log-viewer">Select a log file above.</div>
     </div>
   </div>
 
@@ -1390,6 +1840,53 @@ label { font-size: 0.8rem; color: var(--text2); margin-bottom: 4px; display: blo
   </div>
 </div>
 
+<!-- Copy Presets Modal -->
+<div id="copy-presets-modal" class="modal-overlay">
+  <div class="modal">
+    <h2>Copy Presets From Another Speaker</h2>
+    <p class="text-muted mb">Select a speaker to copy all preset stations from. The UNB IDs on the current speaker will be preserved.</p>
+    <div id="copy-speakers-list"></div>
+    <div class="mt">
+      <button class="btn" onclick="closeModal('copy-presets-modal')">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Import Stations Modal -->
+<div id="import-modal" class="modal-overlay">
+  <div class="modal">
+    <h2>Import Stations</h2>
+    <div class="form-group mb">
+      <label>File (M3U, M3U8, or OPML)</label>
+      <input type="file" id="import-file" accept=".m3u,.m3u8,.opml,.xml" style="background:var(--bg);padding:8px;border:1px solid var(--border);border-radius:var(--radius);width:100%;color:var(--text);">
+    </div>
+    <div class="btn-group mb">
+      <button class="btn btn-primary" onclick="parseImportFile()">Parse File</button>
+    </div>
+    <div id="import-preview-area" style="display:none">
+      <div class="form-group mb">
+        <label>Target Category</label>
+        <input type="text" id="import-category" list="import-cat-list" placeholder="Enter category name">
+        <datalist id="import-cat-list"></datalist>
+      </div>
+      <div class="flex-between mb">
+        <span class="text-muted" id="import-count"></span>
+        <div class="btn-group">
+          <button class="btn btn-sm" onclick="importSelectAll(true)">Select All</button>
+          <button class="btn btn-sm" onclick="importSelectAll(false)">Select None</button>
+        </div>
+      </div>
+      <div id="import-preview" class="import-preview"></div>
+      <div class="btn-group mt">
+        <button class="btn btn-primary" onclick="commitImport()">Import Selected</button>
+      </div>
+    </div>
+    <div class="mt">
+      <button class="btn" onclick="closeModal('import-modal')">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <audio id="audio-preview" preload="none"></audio>
 <div id="toast" class="toast"></div>
 
@@ -1410,6 +1907,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (tab.dataset.panel === 'speakers') loadSpeakers();
     if (tab.dataset.panel === 'stations') loadStations();
     if (tab.dataset.panel === 'services') loadServices();
+    if (tab.dataset.panel === 'logs') loadLogs();
     if (tab.dataset.panel === 'links') loadLinks();
   });
 });
@@ -1462,6 +1960,7 @@ function renderSpeakers() {
           <span class="ip-badge">${esc(s.ip)}</span>
         </div>
         <div class="btn-group">
+          <button class="btn btn-sm" onclick="showCopyPresets('${esc(s.ip)}')">Copy From...</button>
           <button class="btn btn-sm btn-danger" onclick="deleteSpeaker('${esc(s.ip)}')">Delete</button>
         </div>
       </div>
@@ -1614,19 +2113,32 @@ function renderStations() {
     el.innerHTML = '<div class="card"><p class="text-muted">No stations configured.</p></div>';
     return;
   }
-  el.innerHTML = cats.map(([cat, stations]) => `
+  const catKeys = cats.map(c => c[0]);
+  el.innerHTML = cats.map(([cat, stations], ci) => `
     <div class="card">
       <div class="card-header">
-        <h3>${esc(cat)} <span class="category-count">(${stations.length})</span></h3>
+        <div style="display:flex;align-items:center;gap:8px">
+          ${ci > 0 ? `<button class="btn-move" onclick="moveCat(${ci},${ci-1})" title="Move category up">&#9650;</button>` : ''}
+          ${ci < cats.length - 1 ? `<button class="btn-move" onclick="moveCat(${ci},${ci+1})" title="Move category down">&#9660;</button>` : ''}
+          <h3>${esc(cat)} <span class="category-count">(${stations.length})</span></h3>
+        </div>
         <div class="btn-group">
           <button class="btn btn-sm" onclick="addStationToCat('${escAttr(cat)}')">Add</button>
           ${cat !== 'Presets' ? `<button class="btn btn-sm btn-danger" onclick="deleteCategory('${escAttr(cat)}')">Delete Category</button>` : ''}
         </div>
       </div>
-      ${stations.map(s => `
-        <div class="station-item">
+      ${stations.map((s, si) => `
+        <div class="station-item" draggable="true"
+             ondragstart="stationDragStart(event,'${escAttr(cat)}',${si})"
+             ondragover="stationDragOver(event)"
+             ondragenter="stationDragEnter(event)"
+             ondragleave="stationDragLeave(event)"
+             ondrop="stationDrop(event,'${escAttr(cat)}',${si})"
+             ondragend="stationDragEnd(event)">
+          ${si > 0 ? `<button class="btn-move" onclick="moveStation('${escAttr(cat)}',${si},${si-1})" title="Move up">&#9650;</button>` : '<span style="width:22px;display:inline-block"></span>'}
+          ${si < stations.length - 1 ? `<button class="btn-move" onclick="moveStation('${escAttr(cat)}',${si},${si+1})" title="Move down">&#9660;</button>` : '<span style="width:22px;display:inline-block"></span>'}
           <button class="btn-play" onclick="previewStation('${escAttr(s.url)}', this)" title="Preview">&#9654;</button>
-          <span class="station-name">${esc(s.name)}</span>
+          <span class="station-name">${esc(s.name)}${s._dead ? ' <span class=\"health-badge dead\">offline</span>' : ''}</span>
           <span class="station-url" title="${esc(s.url)}">${esc(s.url)}</span>
           ${s.url.includes('/transcode?') ? '<span class="transcode-badge">transcoded</span>' : ''}
           <button class="btn btn-sm" onclick="editStation('${escAttr(cat)}','${escAttr(s.name)}','${escAttr(s.url)}')">Edit</button>
@@ -2146,6 +2658,313 @@ function esc(s) {
 function escAttr(s) {
   if (s == null) return '';
   return String(s).replace(/&/g,'&amp;').replace(/'/g,'&#39;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\\/g,'\\\\');
+}
+
+// ── Copy Presets Between Speakers ─────────────────────────
+function showCopyPresets(targetIp) {
+  const el = document.getElementById('copy-speakers-list');
+  const others = speakersData.filter(s => s.ip !== targetIp);
+  if (!others.length) {
+    el.innerHTML = '<p class="text-muted">No other speakers to copy from.</p>';
+    openModal('copy-presets-modal');
+    return;
+  }
+  el.innerHTML = others.map(s => `
+    <div class="speaker-pick" onclick="doCopyPresets('${esc(s.ip)}','${esc(targetIp)}')">
+      <div style="flex:1">
+        <strong>${esc(s.name || 'Unnamed')}</strong>
+        <span class="ip-badge" style="margin-left:8px">${esc(s.ip)}</span>
+        <div class="text-muted" style="margin-top:4px">${s.presets.filter(p=>p.name).map(p=>esc(p.name)).join(', ') || 'No stations'}</div>
+      </div>
+    </div>
+  `).join('');
+  openModal('copy-presets-modal');
+}
+
+async function doCopyPresets(sourceIp, targetIp) {
+  const source = speakersData.find(s => s.ip === sourceIp);
+  const target = speakersData.find(s => s.ip === targetIp);
+  if (!source || !target) return;
+  if (!confirm(`Copy all presets from ${source.name || sourceIp} to ${target.name || targetIp}?`)) return;
+
+  const fields = ['name', 'url', 'format', 'desc', 'logo', 'mime'];
+  for (let i = 0; i < target.presets.length && i < source.presets.length; i++) {
+    for (const f of fields) {
+      target.presets[i][f] = source.presets[i][f];
+    }
+  }
+  const result = await api(`/api/speakers/${targetIp}/presets`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({presets: target.presets}),
+  });
+  closeModal('copy-presets-modal');
+  if (result.ok) {
+    toast('Presets copied. YTuner restarting...');
+    renderSpeakers();
+  } else {
+    toast(result.error || 'Copy failed', true);
+  }
+}
+
+// ── Backup & Restore ─────────────────────────────────────
+function exportBackup() {
+  window.location.href = _apiBase + 'api/backup';
+}
+
+async function importBackup(input) {
+  const file = input.files[0];
+  if (!file) return;
+  input.value = '';
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    if (data.version !== 1) {
+      toast('Unknown backup version', true);
+      return;
+    }
+    const items = [];
+    if (data.stations_ini) items.push('stations');
+    if (data.speakers_json && Object.keys(data.speakers_json).length) items.push('speaker names');
+    if (data.links_json && data.links_json.length) items.push(`${data.links_json.length} links`);
+    if (data.speaker_xmls) items.push(`${Object.keys(data.speaker_xmls).length} speaker XMLs`);
+    const summary = items.length ? items.join(', ') : 'empty backup';
+    if (!confirm(`Restore backup from ${data.date || 'unknown date'}?\n\nContains: ${summary}\n\nThis will overwrite current configuration.`)) return;
+
+    const result = await api('/api/backup/restore', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: text,
+    });
+    if (result.ok) {
+      toast('Backup restored. YTuner restarting...');
+      setTimeout(() => {
+        loadSpeakers();
+        loadStations();
+        loadLinks();
+      }, 1500);
+    } else {
+      toast(result.error || 'Restore failed', true);
+    }
+  } catch (e) {
+    toast('Invalid backup file: ' + e.message, true);
+  }
+}
+
+// ── Log Viewer ───────────────────────────────────────────
+let currentLogFile = 'ytuner';
+
+async function loadLogs(file) {
+  if (file) currentLogFile = file;
+  const lines = document.getElementById('log-lines').value;
+  // Update button styles
+  document.getElementById('btn-log-ytuner').className = 'btn btn-sm' + (currentLogFile === 'ytuner' ? ' btn-primary' : '');
+  document.getElementById('btn-log-nginx').className = 'btn btn-sm' + (currentLogFile === 'nginx' ? ' btn-primary' : '');
+
+  const el = document.getElementById('log-content');
+  el.textContent = 'Loading...';
+  const data = await api(`/api/logs?file=${currentLogFile}&lines=${lines}`);
+  if (data.error && !data.lines) {
+    el.textContent = 'Error: ' + data.error;
+    return;
+  }
+  if (data.error) {
+    el.textContent = data.error;
+    return;
+  }
+  el.textContent = data.lines.join('\n') || '(empty)';
+  el.scrollTop = el.scrollHeight;
+}
+
+// ── Station Health Check ─────────────────────────────────
+let healthPoll = null;
+
+async function startHealthCheck() {
+  const btn = document.getElementById('btn-healthcheck');
+  btn.textContent = 'Checking...';
+  btn.disabled = true;
+  const result = await api('/api/stations/healthcheck', {method: 'POST'});
+  if (result.error) {
+    toast(result.error, true);
+    btn.textContent = 'Check Health';
+    btn.disabled = false;
+    return;
+  }
+  healthPoll = setInterval(pollHealthCheck, 1000);
+}
+
+async function pollHealthCheck() {
+  const data = await api('/api/stations/healthcheck');
+  const btn = document.getElementById('btn-healthcheck');
+  if (data.total > 0) {
+    btn.textContent = `Checking ${data.checked}/${data.total}...`;
+  }
+  if (!data.running) {
+    clearInterval(healthPoll);
+    healthPoll = null;
+    btn.textContent = 'Check Health';
+    btn.disabled = false;
+    // Mark dead stations in stationsData
+    const deadSet = new Set();
+    for (const r of data.results) {
+      if (!r.alive) deadSet.add(r.category + '::' + r.name);
+    }
+    for (const [cat, stations] of Object.entries(stationsData)) {
+      for (const s of stations) {
+        s._dead = deadSet.has(cat + '::' + s.name);
+      }
+    }
+    renderStations();
+    const deadCount = data.results.filter(r => !r.alive).length;
+    if (deadCount > 0) {
+      toast(`Health check done: ${deadCount} station(s) offline`, true);
+    } else {
+      toast(`Health check done: all ${data.total} stations OK`);
+    }
+  }
+}
+
+// ── M3U / OPML Import ────────────────────────────────────
+let importedStations = [];
+
+function showImportModal() {
+  document.getElementById('import-file').value = '';
+  document.getElementById('import-preview-area').style.display = 'none';
+  document.getElementById('import-category').value = '';
+  // Populate category datalist
+  const dl = document.getElementById('import-cat-list');
+  dl.innerHTML = Object.keys(stationsData).map(c => `<option value="${esc(c)}">`).join('');
+  openModal('import-modal');
+}
+
+async function parseImportFile() {
+  const fileInput = document.getElementById('import-file');
+  const file = fileInput.files[0];
+  if (!file) { toast('Select a file first', true); return; }
+
+  const text = await file.text();
+  const name = file.name.toLowerCase();
+  let fmt = 'm3u';
+  if (name.endsWith('.opml') || name.endsWith('.xml')) fmt = 'opml';
+
+  const result = await api('/api/stations/import', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({format: fmt, content: text}),
+  });
+
+  if (result.error) {
+    toast(result.error, true);
+    return;
+  }
+
+  importedStations = result.stations || [];
+  if (!importedStations.length) {
+    toast('No stations found in file', true);
+    return;
+  }
+
+  document.getElementById('import-preview-area').style.display = 'block';
+  document.getElementById('import-count').textContent = `${importedStations.length} stations found`;
+  const el = document.getElementById('import-preview');
+  el.innerHTML = importedStations.map((s, i) => `
+    <div class="import-item">
+      <label><input type="checkbox" checked data-idx="${i}"> ${esc(s.name)}</label>
+      <span class="station-url" title="${esc(s.url)}">${esc(s.url)}</span>
+    </div>
+  `).join('');
+}
+
+function importSelectAll(checked) {
+  document.querySelectorAll('#import-preview input[type=checkbox]').forEach(cb => cb.checked = checked);
+}
+
+async function commitImport() {
+  const cat = document.getElementById('import-category').value.trim();
+  if (!cat) { toast('Enter a category name', true); return; }
+
+  const selected = [];
+  document.querySelectorAll('#import-preview input[type=checkbox]:checked').forEach(cb => {
+    const idx = parseInt(cb.dataset.idx);
+    selected.push(importedStations[idx]);
+  });
+
+  if (!selected.length) { toast('No stations selected', true); return; }
+
+  if (!stationsData[cat]) stationsData[cat] = [];
+  for (const s of selected) {
+    stationsData[cat].push({name: s.name, url: s.url});
+  }
+
+  const result = await api('/api/stations', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(stationsData),
+  });
+  closeModal('import-modal');
+  if (result.ok) {
+    toast(`Imported ${selected.length} station(s) to "${cat}"`);
+    renderStations();
+  } else {
+    toast(result.error || 'Import failed', true);
+  }
+}
+
+// ── Station Reordering ───────────────────────────────────
+async function moveStation(cat, fromIdx, toIdx) {
+  const stations = stationsData[cat];
+  if (!stations || toIdx < 0 || toIdx >= stations.length) return;
+  const [item] = stations.splice(fromIdx, 1);
+  stations.splice(toIdx, 0, item);
+  renderStations();
+  await api('/api/stations', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(stationsData),
+  });
+}
+
+async function moveCat(fromIdx, toIdx) {
+  const entries = Object.entries(stationsData);
+  const [item] = entries.splice(fromIdx, 1);
+  entries.splice(toIdx, 0, item);
+  stationsData = Object.fromEntries(entries);
+  renderStations();
+  await api('/api/stations', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(stationsData),
+  });
+}
+
+// Drag-and-drop for stations within same category
+let dragCat = null, dragIdx = null;
+function stationDragStart(e, cat, idx) {
+  dragCat = cat; dragIdx = idx;
+  e.target.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+}
+function stationDragOver(e) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; }
+function stationDragEnter(e) { e.preventDefault(); e.currentTarget.classList.add('drag-over'); }
+function stationDragLeave(e) { e.currentTarget.classList.remove('drag-over'); }
+function stationDragEnd(e) {
+  e.target.classList.remove('dragging');
+  document.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+}
+function stationDrop(e, targetCat, targetIdx) {
+  e.preventDefault();
+  e.currentTarget.classList.remove('drag-over');
+  if (dragCat !== targetCat || dragIdx === null || dragIdx === targetIdx) return;
+  const stations = stationsData[dragCat];
+  const [item] = stations.splice(dragIdx, 1);
+  stations.splice(targetIdx, 0, item);
+  renderStations();
+  api('/api/stations', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(stationsData),
+  });
+  dragCat = null; dragIdx = null;
 }
 
 // ── Init ─────────────────────────────────────────────────

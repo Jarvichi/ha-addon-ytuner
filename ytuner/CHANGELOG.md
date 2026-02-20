@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0
+
+- Add Backup & Restore: export/import all config (stations, speakers, links) as a single JSON file
+- Add Copy Presets Between Speakers: copy station assignments from one speaker to another
+- Add Log Viewer tab: view YTuner and Nginx logs with line count selector and refresh
+- Add Station Health Check: probe all stations for connectivity, mark dead stations inline
+- Add M3U/OPML Import: import station lists from .m3u, .m3u8, and .opml files with preview
+- Add Station & Category Reordering: up/down arrows and drag-and-drop to reorder stations and categories
+- Fix mobile responsiveness: header tabs wrap, preset table uses stacked layout, station items wrap, modals fit screen
+
 ## 1.0.5
 
 - Fix JS syntax error that broke the entire web UI
