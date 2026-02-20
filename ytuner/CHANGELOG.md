@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.5
+
+- Fix JS syntax error that broke the entire web UI
+  - Regex in Python raw string produced invalid JS (`/^\\/` instead of `/^\/`)
+  - This caused a parse error preventing all JavaScript from executing
+  - Tabs, buttons, and all UI interactions were non-functional
+- Add console logging for debugging API base path detection
+
 ## 1.0.4
 
 - Fix web UI not working inside Home Assistant ingress iframe

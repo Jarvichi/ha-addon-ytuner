@@ -1,6 +1,6 @@
 name: "YTuner"
 description: "vTuner internet radio replacement for AVR devices and Libratone speakers"
-version: "1.0.4"
+version: "1.0.5"
 slug: "ytuner"
 url: "https://github.com/Jarvichi/ha-addon-ytuner"
 arch:

@@ -1434,7 +1434,7 @@ const _apiBase = (() => {
   return p;
 })();
 async function api(path, opts) {
-  const url = _apiBase + path.replace(/^\\//, '');
+  const url = _apiBase + path.replace(/^\//, '');
   const resp = await fetch(url, opts);
   return resp.json();
 }
@@ -2149,7 +2149,8 @@ function escAttr(s) {
 }
 
 // ── Init ─────────────────────────────────────────────────
-loadSpeakers();
+console.log('[YTuner] apiBase=' + _apiBase, 'pathname=' + window.location.pathname);
+loadSpeakers().catch(e => console.error('[YTuner] loadSpeakers failed:', e));
 </script>
 </body>
 </html>
