@@ -23,6 +23,14 @@ The add-on runs four services in a single container:
 | **Web UI** | 8080 | Speaker and station management |
 | **Transcode Proxy** | 8888 | Converts non-MP3 streams via FFmpeg |
 
+## Screenshots
+
+| Speakers | Station Library | Services |
+|----------|-----------------|----------|
+| ![Speakers](ytuner/screenshots/speakers.jpeg) | ![Station Library](ytuner/screenshots/station-library.jpeg) | ![Services](ytuner/screenshots/services.jpeg) |
+
+Manage speaker presets, browse and import stations, monitor services, view logs, and backup/restore your configuration — all from a mobile-friendly web UI.
+
 ## Configuration
 
 See the [add-on documentation](ytuner/DOCS.md) for full details.

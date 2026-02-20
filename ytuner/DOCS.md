@@ -4,6 +4,22 @@
 
 YTuner is a vTuner internet radio replacement service for AVR devices (Yamaha, Denon, Pioneer, Marantz) and Libratone speakers. This add-on packages the entire YTuner stack into a single Home Assistant add-on.
 
+## Web UI
+
+The add-on includes a mobile-friendly web management interface accessible on port 8080 or via the Home Assistant sidebar.
+
+| Speakers | Station Library | Services |
+|----------|-----------------|----------|
+| ![Speakers](https://raw.githubusercontent.com/Jarvichi/ha-addon-ytuner/master/ytuner/screenshots/speakers.jpeg) | ![Station Library](https://raw.githubusercontent.com/Jarvichi/ha-addon-ytuner/master/ytuner/screenshots/station-library.jpeg) | ![Services](https://raw.githubusercontent.com/Jarvichi/ha-addon-ytuner/master/ytuner/screenshots/services.jpeg) |
+
+### Features
+
+- **Speakers** — Configure Libratone speaker presets, copy presets between speakers, auto-discover preset IDs
+- **Station Library** — Add, edit, and delete stations; search Radio Browser; import M3U/OPML playlists; health check all stations
+- **Services** — Monitor YTuner and transcode proxy status, restart services, export/import backups
+- **Logs** — View YTuner and Nginx logs in real-time
+- **Links** — Quick links to other services on your network
+
 ## Services
 
 The add-on runs four services:
