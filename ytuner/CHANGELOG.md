@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.3
+
+- Fix speaker discovery: parse nginx access log instead of YTuner debug log
+  - YTuner log shows hostname (company2.vtuner.com) not IP, so the old regex never matched
+  - Nginx access log has both client IP and search ID on one line — much more reliable
+  - Falls back to YTuner debug log parsing for non-container installs
+- Write nginx access log to /data/nginx-access.log for discovery to tail
+
 ## 1.0.2
 
 - Fix speaker discovery: write YTuner log to /data/ytuner.log so the web UI can tail it for preset detection

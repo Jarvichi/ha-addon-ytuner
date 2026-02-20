@@ -88,17 +88,29 @@ def reset_discovery():
         })
 
 
+def _discovery_log_file():
+    """Return the best log file for discovery: nginx access log or ytuner log."""
+    for path in ["/data/nginx-access.log", LOG_FILE]:
+        if os.path.exists(path):
+            return path
+    return LOG_FILE
+
+
 def discovery_watcher():
-    """Background thread: tail -F the ytuner log looking for Device/Search lines."""
+    """Background thread: tail nginx access log for speaker preset requests."""
     try:
+        log_path = _discovery_log_file()
         proc = subprocess.Popen(
-            ["tail", "-F", "-n", "0", LOG_FILE],
+            ["tail", "-F", "-n", "0", log_path],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True,
         )
         with discovery_lock:
             discovery_state["tail_proc"] = proc
 
+        # Matches nginx access log: "192.168.5.31 - - [...] "GET /...?search=80195 ..."
+        nginx_re = re.compile(r"^([\d.]+)\s.*sSearchtype=3&search=(\d+)")
+        # Fallback: YTuner debug log (two-line: Device then search)
         device_re = re.compile(r"Device : \? -> ([\d.]+)\.")
         search_re = re.compile(r"search=(\d+)")
 
@@ -109,6 +121,33 @@ def discovery_watcher():
                 if not discovery_state["active"]:
                     break
 
+            # Try nginx access log format first (IP + search on same line)
+            m_nginx = nginx_re.search(line)
+            if m_nginx:
+                client_ip = m_nginx.group(1)
+                station_id = m_nginx.group(2)
+                with discovery_lock:
+                    if discovery_state["ip"] is None:
+                        xml_path = os.path.join(CONFIG_DIR, f"{client_ip}.xml")
+                        if os.path.exists(xml_path):
+                            continue
+                        discovery_state["ip"] = client_ip
+
+                    if client_ip == discovery_state["ip"]:
+                        idx = discovery_state["expected"]
+                        discovery_state["presets"].append({
+                            "id": station_id,
+                            "index": idx,
+                        })
+                        discovery_state["expected"] = idx + 1
+                        if idx >= 5:
+                            discovery_state["done"] = True
+
+                    if discovery_state["done"]:
+                        break
+                continue
+
+            # Fallback: YTuner debug log (two separate lines)
             m_dev = device_re.search(line)
             if m_dev:
                 pending_ip = m_dev.group(1)
@@ -118,17 +157,13 @@ def discovery_watcher():
             if m_search and pending_ip:
                 station_id = m_search.group(1)
                 with discovery_lock:
-                    # If we haven't locked onto an IP yet, use this one
                     if discovery_state["ip"] is None:
-                        # Check it's not an already-configured speaker
                         xml_path = os.path.join(CONFIG_DIR, f"{pending_ip}.xml")
                         if os.path.exists(xml_path):
-                            # Known speaker, ignore
                             pending_ip = None
                             continue
                         discovery_state["ip"] = pending_ip
 
-                    # Only accept events from our discovered IP
                     if pending_ip == discovery_state["ip"]:
                         idx = discovery_state["expected"]
                         discovery_state["presets"].append({
