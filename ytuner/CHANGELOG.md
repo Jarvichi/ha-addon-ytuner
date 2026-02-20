@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.4
+
+- Fix web UI not working inside Home Assistant ingress iframe
+  - API calls used absolute paths (`/api/speakers`) which broke under ingress proxy
+  - Now resolves API paths relative to the page base URL
+- Fix duplicate preset IDs during speaker discovery
+  - Cycling through presets no longer records the same ID multiple times
+  - Only unique preset IDs are added to the discovery list
+
 ## 1.0.3
 
 - Fix speaker discovery: parse nginx access log instead of YTuner debug log

@@ -134,14 +134,16 @@ def discovery_watcher():
                         discovery_state["ip"] = client_ip
 
                     if client_ip == discovery_state["ip"]:
-                        idx = discovery_state["expected"]
-                        discovery_state["presets"].append({
-                            "id": station_id,
-                            "index": idx,
-                        })
-                        discovery_state["expected"] = idx + 1
-                        if idx >= 5:
-                            discovery_state["done"] = True
+                        existing_ids = {p["id"] for p in discovery_state["presets"]}
+                        if station_id not in existing_ids:
+                            idx = discovery_state["expected"]
+                            discovery_state["presets"].append({
+                                "id": station_id,
+                                "index": idx,
+                            })
+                            discovery_state["expected"] = idx + 1
+                            if idx >= 5:
+                                discovery_state["done"] = True
 
                     if discovery_state["done"]:
                         break
@@ -165,14 +167,16 @@ def discovery_watcher():
                         discovery_state["ip"] = pending_ip
 
                     if pending_ip == discovery_state["ip"]:
-                        idx = discovery_state["expected"]
-                        discovery_state["presets"].append({
-                            "id": station_id,
-                            "index": idx,
-                        })
-                        discovery_state["expected"] = idx + 1
-                        if idx >= 5:
-                            discovery_state["done"] = True
+                        existing_ids = {p["id"] for p in discovery_state["presets"]}
+                        if station_id not in existing_ids:
+                            idx = discovery_state["expected"]
+                            discovery_state["presets"].append({
+                                "id": station_id,
+                                "index": idx,
+                            })
+                            discovery_state["expected"] = idx + 1
+                            if idx >= 5:
+                                discovery_state["done"] = True
 
                 pending_ip = None
 
@@ -1423,8 +1427,15 @@ function openModal(id) { document.getElementById(id).classList.add('open'); }
 function closeModal(id) { document.getElementById(id).classList.remove('open'); }
 
 // ── API helpers ──────────────────────────────────────────
+const _apiBase = (() => {
+  // Detect base path for HA ingress compatibility
+  let p = window.location.pathname;
+  if (!p.endsWith('/')) p += '/';
+  return p;
+})();
 async function api(path, opts) {
-  const resp = await fetch(path, opts);
+  const url = _apiBase + path.replace(/^\\//, '');
+  const resp = await fetch(url, opts);
   return resp.json();
 }
 
